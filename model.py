@@ -74,7 +74,7 @@ def clustering(x, eps=0.6, num_samples=4):
     :param x: input from target domain
     :return: clustering number
     """
-    return len(np.unique(DBSCAN(eps=eps, num_samples=num_samples, n_jobs=-1).fit_predict(x)))
+    return len(np.unique(DBSCAN(eps=eps, num_samples=num_samples, metric="jaccard", n_jobs=-1).fit_predict(x)))
 
 
 class HybridClassifier(nn.Module):

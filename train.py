@@ -161,3 +161,4 @@ def train(path_image_source,
             loss.backward()
             optimizer.step()
             lr_scheduler.step()
+    torch.save(model.state_dict(), "model.pth")
