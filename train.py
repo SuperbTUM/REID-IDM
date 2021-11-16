@@ -1,5 +1,5 @@
 from torch.utils.data import Dataset, DataLoader
-from model import Model, clustering
+from model import Model, clustering, FeatureExtractor
 import numpy as np
 import pandas as pd
 import cv2
@@ -29,12 +29,16 @@ def fetch_data(path_image, path_label=None):
 
 def load_model_data(path_image_source,
                     path_label_source,
+                    label_target_train=None,
                     stage=0,
                     learning_rate=3.5e-4,
                     cuda=False):
     source_images, source_labels = fetch_data(path_image_source, path_label_source)
     cs = len(np.unique(source_labels))
-    ct = clustering(source_images)
+    if label_target_train:
+        ct = len(label_target_train)
+    else:
+        ct = 0
     if cuda:
         model = Model(cs, ct, insert=stage).cuda()
     else:
@@ -43,7 +47,8 @@ def load_model_data(path_image_source,
     lr_scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=20, gamma=0.1)
     model_content = (model, optimizer, lr_scheduler)
     source_data = (source_images, source_labels)
-    return model_content, source_data, cs + ct
+    num_classes = cs + ct
+    return model_content, source_data, num_classes
 
 
 class DataLoaderX(DataLoader):
@@ -52,57 +57,68 @@ class DataLoaderX(DataLoader):
 
 
 class MyDataset(Dataset):
-    def __init__(self, images, labels, images_target, labels_target, train=True, transform=None):
+    def __init__(self, images, labels, train=True, transform=None):
         super(MyDataset, self).__init__()
-        self.images_source = images
-        self.labels_source = labels
-        self.images_target = images_target
-        self.labels_target = labels_target
+        self.images = images
+        self.labels = labels
         self.train = train
         self.transform = transform
 
     def __len__(self):
-        if isinstance(self.images_source, list):
-            return len(self.images_source)
+        if isinstance(self.images, list):
+            return len(self.images)
         else:
-            return self.images_source.shape[0]
+            return self.images.shape[0]
 
     def __getitem__(self, item):
-        image_source = self.images_source[item]
-        label_source = self.labels_source[item]
-        image_target = self.images_target[item]
+        image = self.images[item]
         if self.transform:
-            image_source = self.transform(image_source)
-            image_target = self.transform(image_target)
-        if self.train:
-            label_target = self.labels_target[item]
-            return image_source, torch.tensor(label_source).int(), image_target, torch.tensor(label_target).int()
+            image = self.transform(image)
+        if self.train and self.labels:
+            label = self.labels[item]
+            return image, torch.tensor(label).int()
         else:
-            label_target = None
-            return image_source, torch.tensor(label_source).int(), image_target, label_target
+            label = None
+            return image, label
 
 
 def collate(batch):
-    image_sources = []
-    label_sources = []
-    image_targets = []
-    label_targets = []
+    images = []
+    labels = []
     for sample in batch:
-        image_source, label_source, image_target, label_target = sample
-        image_sources.append(image_source)
-        label_sources.append(label_source)
-        image_targets.append(image_target)
-        if label_target:
-            label_targets.append(label_target)
-    image_sources = torch.Tensor(image_sources).float()
-    label_sources = torch.Tensor(label_sources).int()
-    image_targets = torch.Tensor(image_targets).float()
-    if label_targets:
-        label_targets = torch.Tensor(label_targets).int()
-        batch = (image_sources, label_sources, image_targets, label_targets)
+        image, label = sample
+        images.append(image)
+        if label:
+            labels.append(label)
+    images = torch.Tensor(images).float()
+    if labels:
+        labels = torch.Tensor(labels).int()
+        batch = images, labels
     else:
-        batch = (image_sources, label_sources, image_targets)
+        batch = images, None
     return batch
+
+
+class IterLoader:
+    def __init__(self, loader, length=None):
+        self.loader = loader
+        self.length = length
+        self.iter = None
+
+    def __len__(self):
+        if self.length:
+            return self.length
+        return len(self.loader)
+
+    def new_epoch(self):
+        self.iter = iter(self.loader)
+
+    def next(self):
+        try:
+            return next(self.iter)
+        except:
+            self.iter = iter(self.loader)
+            return next(self.iter)
 
 
 def train(path_image_source,
@@ -130,23 +146,32 @@ def train(path_image_source,
         transforms.Pad(10),
         transforms.Resize(resized),
         transforms.ToTensor(),
-        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+        transforms.RandomErasing(p=0.5)
     ])
-    dataset = MyDataset(images_source, labels_source, images_target, labels_target, train, transform)
+    source_dataset = MyDataset(images_source, labels_source, train, transform)
+    target_dataset = MyDataset(images_target, labels_target, train, transform)
 
     for epoch in range(max_epoch):
-        train_loader = DataLoaderX(dataset, batch_size=batch_size, shuffle=True, num_workers=4,
-                                   pin_memory=True, collate_fn=collate)
-        for samples in tqdm(train_loader):
+        train_loader_source = IterLoader(DataLoaderX(source_dataset, batch_size=batch_size, shuffle=True, num_workers=4,
+                                                     pin_memory=True, collate_fn=collate))
+        train_loader_target = IterLoader(DataLoaderX(target_dataset, batch_size=batch_size, shuffle=True, num_workers=4,
+                                                     pin_memory=True, collate_fn=collate))
+        features, _ = FeatureExtractor(0, train_loader_target)
+        labels_target = clustering(features)  # use this to construct a new dataset
+        train_iters = len(target_dataset) // batch_size
+        for _ in range(train_iters):
             optimizer.zero_grad()
-            if len(samples) == 3:
-                image_source, label_source, image_target = samples
-            else:
-                image_source, label_source, image_target, label_target = samples
+            train_loader_source.new_epoch()
+            train_loader_target.new_epoch()
+            image_source, label_source = train_loader_source.next()
+            image_target, _ = train_loader_target.next()
+
             C, H, W = image_source.shape
             inputs = torch.cat([image_source, image_target], dim=1).view(-1, C, H, W)
             if cuda:
                 inputs = inputs.cuda()
+            model.train()
             prob, features, a = model(inputs, stage=stage, train=train)
             size = features.shape[0]
             feat_s, feat_inter, feat_t = features[:size // 3], features[size // 3:2 * size // 3], features[

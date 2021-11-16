@@ -3,6 +3,9 @@ import torch.nn as nn
 from torchvision import models
 from sklearn.cluster import DBSCAN
 import numpy as np
+from torch.nn import functional as F
+from collections import OrderedDict
+
 
 pretrained = False
 resnet50 = models.resnet50(pretrained=pretrained)
@@ -72,13 +75,13 @@ def clustering(x, eps=0.6, num_samples=4):
     :param eps: critical parameters of DBSCAN
     :param num_samples: same as above
     :param x: input from target domain
-    :return: clustering number
+    :return: clustering
     """
-    return len(np.unique(DBSCAN(eps=eps, num_samples=num_samples, metric="jaccard", n_jobs=-1).fit_predict(x)))
+    return DBSCAN(eps=eps, num_samples=num_samples, metric="jaccard", n_jobs=-1).fit_predict(x)
 
 
 class HybridClassifier(nn.Module):
-    def __init__(self, cs, ct):
+    def __init__(self, cs, ct, norm=False):
         """
         This is a hybrid classifier after the global average pooling layer
         :param cs: the number of identities in the source domain
@@ -86,6 +89,7 @@ class HybridClassifier(nn.Module):
         """
         super(HybridClassifier, self).__init__()
         input_channels = resnet50.fc.in_features
+        self.norm = norm
         self.bn = nn.BatchNorm1d(input_channels)
         self.dropout = nn.Dropout(0.1)
         self.fc = nn.Linear(input_channels, cs + ct, bias=False)
@@ -100,6 +104,10 @@ class HybridClassifier(nn.Module):
 
     def forward(self, x):
         x = self.bn(x)
+        if self.norm:
+            x = F.normalize(x)
+        else:
+            x = F.relu(x)
         x = self.dropout(x)
         x = self.fc(x)
         x = self.softmax(x)
@@ -149,9 +157,10 @@ class IDM_MODULE(nn.Module):
 
 
 class Model(nn.Module):
-    def __init__(self, cs, ct, insert=0):
+    def __init__(self, cs, ct=0, insert=0, dropout=0, F_only=False):
         super(Model, self).__init__()
         self.stage0 = Stage0_resnet50()
+        self.F_only = F_only
         if insert == 0:
             self.idm = IDM_MODULE(input_channels=64)
         self.stage1 = Stage1_resnet50()
@@ -167,7 +176,11 @@ class Model(nn.Module):
         if insert == 4:
             self.idm = IDM_MODULE(input_channels=2048)
         self.avepool = GAP()
-        self.classifier = HybridClassifier(cs=cs, ct=ct)
+        self.dropout = dropout
+        if self.dropout:
+            self.drop = nn.Dropout(self.dropout)
+        if cs + ct > 0:
+            self.classifier = HybridClassifier(cs=cs, ct=ct)
 
     def forward(self, x, insert=0, train=True):
         """
@@ -193,5 +206,23 @@ class Model(nn.Module):
         if insert == 4 and train:
             x, a = self.idm(x)
         x_ = self.avepool(x)
+        if self.F_only:
+            return x
+        if self.dropout:
+            x_ = self.drop(x_)
         prob = self.classifier(x_)
         return prob, x, a
+
+
+def FeatureExtractor(cs, data_loader):
+    model = Model(cs=cs, F_only=True)
+    features = OrderedDict()
+    labels = OrderedDict()
+    with torch.no_grad():
+        for sample in data_loader:
+            image, label = sample
+            output = model(image)
+            for i, (image, label) in enumerate(zip(image, label)):
+                features[i] = output
+                labels[i] = label
+    return features, labels

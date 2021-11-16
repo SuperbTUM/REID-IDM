@@ -34,7 +34,7 @@ class TestModel(nn.Module):
         x = self.layer2(x)
         x = self.layer3(x)
         x = self.layer4(x)
-        x = x.view(-1, 1)
+        x = x.view(x.size(0), -1)
         x = self.batchnorm(x)
         norm_x = F.normalize(x, p=2, dim=-1)
         if output_prob is False:
